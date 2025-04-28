@@ -1,0 +1,17 @@
+fs: 48000
+room_dim:
+- 6.032
+- 6.032
+- 3.971
+room_floor_m2: 36.38
+source_pos:
+- 2.525
+- 3.087
+- 2.077
+azimuth_deg: 171.8
+elevation_deg: 10.42
+source_distance_m: 0.505
+fullband_T30_ms: 326.4
+mic: tetra r=0.05
+target_asl_dB: 90.31
+foa_format: SN3D ACN (WXYZ)

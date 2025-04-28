@@ -1,0 +1,8 @@
+numpy
+scipy
+pyroomacoustics
+soundfile
+librosa
+PyYAML
+pandas
+openai
