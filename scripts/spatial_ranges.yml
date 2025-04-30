@@ -1,0 +1,16 @@
+# spatial_ranges.yml
+
+AREA_MIN: 13.3
+AREA_MAX: 277.4
+AZ_MIN:   -180.0
+AZ_MAX:    180.0
+EL_MIN:   -48.1
+EL_MAX:    48.7
+DIST_MIN:   0.5
+DIST_MAX:   4.0
+ASL_MIN:   85.0
+ASL_MAX:  100.0
+ABS_MIN:   0.041
+ABS_MAX:   0.294
+T30_MIN_MS: 144.5
+T30_MAX_MS: 2671.9

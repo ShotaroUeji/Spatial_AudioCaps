@@ -15,8 +15,7 @@ Dependencies:
 """
 
 import openai
-openai.api_key = "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"
-
+openai.api_key = "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"
 import os
 import argparse
 import yaml
