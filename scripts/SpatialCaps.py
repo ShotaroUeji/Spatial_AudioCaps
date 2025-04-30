@@ -4,23 +4,22 @@ SpatialCaps.py: Rewrite a spatial audio caption using OpenAI's Chat API.
 
 Usage (Windows PowerShell):
   # Set your API key in PowerShell
-  $Env:OPENAI_API_KEY = "your_api_key_here"
+  $Env:OPENAI_API_KEY = "your_api_key_here"　必須linuxだとexport OPENAI_API_KEY="your_api_key_here"　かも
   python SpatialCaps.py --meta output/meta.yml --caption "Someone crumples paper"
 
 Alternative: derive original caption from a CSV mapping of IDs (e.g., train.csv):
   python SpatialCaps.py --meta output/meta.yml --id 91139 --csv train.csv
-
 Dependencies:
   pip install openai pyyaml pandas
 """
-
-import openai
-openai.api_key = "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"
 import os
+import openai
+openai.api_key = os.getenv("OPENAI_API_KEY")
+
+
 import argparse
 import yaml
 import pandas as pd
-import openai
 import sys
 def load_meta(path):
     with open(path, 'r', encoding='utf-8') as f:
