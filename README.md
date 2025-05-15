@@ -1,6 +1,5 @@
 
 
-```markdown
 # Spatial-AudioCaps  🌐🎧  
 **AudioCaps**（ステレオ音源＋字幕）を **空間拡張 (FOA/WXYZ＋空間キャプション)** し、  
 ELSA 論文と同じ統計分布をもつ **Spatial-AudioCaps** をワンコマンド生成するツール群です。
