@@ -1,171 +1,200 @@
 #!/usr/bin/env python3
-# SpatialAudio.py  –  正四面体マイク 4-ch ＋ FOA(WXYZ) 4-ch を生成
-#   ・入力: mono WAV または MP3
-#   ・出力: mic4.wav foa.wav rir.npy meta.yml
-#
-#   pip install pyroomacoustics numpy scipy soundfile pyyaml librosa
-
-import random, sys, yaml
+"""SpatialAudio.py  –  mono/stereo 音声 → 4ch 正四面体 + FOA + (任意で stereo)
+   ・RIR は gen_room_pool.py が作った JSON から 1 件取得
+   ・split 指定で trainval / test どちらのプールを使うか自動切替
+"""
+import random, json, yaml, math, sys
 from pathlib import Path
-import numpy as np
-import soundfile as sf
+import numpy as np, librosa, soundfile as sf
 from scipy.signal import fftconvolve
 import pyroomacoustics as pra
-import librosa  # MP3 / 各種フォーマット読み込み用
+from typing import Literal
+# ───────────────── 設定ロード
+cfg = yaml.safe_load(Path("spatial_ranges.yml").read_text())
 
-# ──────────────────── 設定ロード ────────────────────
-_cfg_path = Path(__file__).with_name('spatial_ranges.yml')
-with open(_cfg_path, 'r') as f:
-    cfg = yaml.safe_load(f)
+# ──────────────────── 量子化グリッド & ヘルパ ──────────────────────
+# 距離: 1 cm (=0.01 m) 単位  /  角度: 1° 単位
+GRID_CM  = 1       # [cm]
+GRID_DEG = 1        # [deg]
 
-AREA_MIN, AREA_MAX = cfg['AREA_MIN'], cfg['AREA_MAX']
-AZ_MIN, AZ_MAX       = cfg['AZ_MIN'],   cfg['AZ_MAX']
-EL_MIN, EL_MAX       = cfg['EL_MIN'],   cfg['EL_MAX']
-DIST_MIN, DIST_MAX   = cfg['DIST_MIN'], cfg['DIST_MAX']
-ASL_MIN, ASL_MAX     = cfg['ASL_MIN'],  cfg['ASL_MAX']
-ABS_MIN, ABS_MAX     = cfg['ABS_MIN'],  cfg['ABS_MAX']
-# T30 が必要なら
-#T30_MIN_MS, T30_MAX_MS = cfg['T30_MIN_MS'], cfg['T30_MAX_MS']
 
-# ───── 前処理ユーティリティ ─── 無音除去＆最低長保証 ─────
-def trim_and_pad(wav: np.ndarray, fs: int, min_sec: float = 4.0, top_db: float = 20.0):
-    # 無音トリミング
-    wav_trim, _ = librosa.effects.trim(wav, top_db=top_db)
-    # 最短長保証
-    min_len = int(min_sec * fs)
-    if len(wav_trim) < min_len:
-        n_rep = int(np.ceil(min_len / len(wav_trim)))
-        wav_trim = np.tile(wav_trim, n_rep)
-    # 4秒以上はそのまま返す
-    return wav_trim
 
-# ──────────────────── ユーティリティ ────────────────────
-db   = lambda x: 20 * np.log10(max(x, 1e-12))
-undb = lambda d: 10 ** (d / 20)
+POOL = {
+    "train": json.loads(Path("room_pool_trainval.json").read_text()),
+    "val"  : json.loads(Path("room_pool_trainval.json").read_text()),
+    "test" : json.loads(Path("room_pool_test.json").read_text()),
+}
 
-def active_rms(x, fs, hop=0.02, thr=-50):
-    hop = int(hop * fs)
-    rms = [np.sqrt(np.mean(x[i:i+hop]**2)) for i in range(0, len(x) - hop, hop)]
-    act = [r for r in rms if db(r) > thr]
-    return np.sqrt(np.mean(act**2)) if act else np.sqrt(np.mean(x**2))
 
-def convolve_mc(sig, rir_lst):
-    outs = [fftconvolve(sig, r.ravel(), mode='full') for r in rir_lst]
-    Tmax = max(len(o) for o in outs)
-    outs = [np.pad(o, (0, Tmax - len(o))) for o in outs]
-    return np.stack(outs)
+def _snap(val: float, grid: float) -> float:
+    """val を grid 単位に丸めて返す"""
+    return round(val / grid) * grid
 
-# ──────────────────── 仮想部屋＋マイク ────────────────────
-def random_room(fs: int):
-    area = random.uniform(AREA_MIN, AREA_MAX)
-    w = h = np.sqrt(area)
-    H = random.uniform(2.5, 4.0)
-    dims = [w, h, H]
 
-    alpha = random.uniform(ABS_MIN, ABS_MAX)
-    room = pra.ShoeBox(dims, fs=fs,
-                       materials=pra.Material(alpha),
-                       max_order=6)
-
-    # 正四面体マイク (半径 5 cm)
-    r = 0.05; v = r / np.sqrt(3)
-    tet = np.array([[ v,  v,  v],
-                    [ v, -v, -v],
-                    [-v,  v, -v],
-                    [-v, -v,  v]]).T
-    ctr = np.array(dims) / 2
-    room.add_microphone_array(
-        pra.MicrophoneArray(ctr.reshape(3,1) + tet, fs)
-    )
-    return room, ctr, alpha
-
-# ──────────────────── メイン処理 ─────────────────────────
-def spatial_foa(infile: Path, out_dir: Path):
-    # 1) 入力ファイル読み込み
+def _load_audio(infile: Path):
+    """
+    ① soundfile で読めれば最速（libsndfile が mp3 対応なら mp3 も OK）
+    ② 失敗したら librosa+audioread にフォールバック
+       mono=True で単 ch、 sr=None で原本サンプリング周波数
+    """
     try:
         wav, fs = sf.read(str(infile))
-    except:
+        if wav.ndim > 1:           # ステレオ→mono 平均
+            wav = wav.mean(axis=1)
+    except Exception:              # mp3 コーデック無しなど
         wav, fs = librosa.load(str(infile), sr=None, mono=True)
-    if wav.ndim > 1:
-        wav = wav.mean(1)
-    print(f'Loaded {infile.name}: {len(wav)/fs:.2f}s @ {fs} Hz')
+    return wav.astype(np.float32), fs
 
-    # 前処理: 無音除去＋最低4秒保証
-    wav = trim_and_pad(wav, fs, min_sec=4.0, top_db=30.0)
-    print(f'  → after trim/pad: {len(wav)/fs:.2f}s')
 
-    # 2) 部屋と音源配置
-    room, ctr, alpha = random_room(fs)
-    dist = random.uniform(DIST_MIN, DIST_MAX)
-    az   = np.deg2rad(random.uniform(AZ_MIN, AZ_MAX))
-    el   = np.deg2rad(random.uniform(EL_MIN, EL_MAX))
-    src  = ctr + dist * np.array([
-               np.cos(el)*np.cos(az),
-               np.cos(el)*np.sin(az),
-               np.sin(el)
-           ])
-    src = np.clip(src, 0.2, np.array(room.shoebox_dim) - 0.2)
+
+def _rand_room(split):
+    return random.choice(POOL[split])
+
+# ──────────────────────── 位置サンプリング ─────────────────────────
+def _rand_position(
+    split    : str,
+    ctr      : np.ndarray,
+    dist_rng : tuple[float,float] | None = None,
+    el_rng   : tuple[float,float] | None = None
+) -> tuple[np.ndarray,float,float,float]:
+    """
+    • split ('train'|'val'|'test') から専用レンジを自動選択
+    • 1 cm / 1° で量子化し
+    • (dist, az, el) セル和の偶奇で
+      train/val = 偶数セル, test = 奇数セル
+      に振り分けて “絶対重複なし” を保証
+    """
+
+    # split ごとのレンジを取得
+    if dist_rng is None or el_rng is None:
+        rng_cfg = cfg["TEST"] if split == "test" else cfg["TRAINVAL"]
+        dist_min, dist_max = rng_cfg["DIST_MIN"], rng_cfg["DIST_MAX"]
+        el_min,   el_max   = rng_cfg["EL_MIN"],   rng_cfg["EL_MAX"]
+    else:
+        dist_min, dist_max = dist_rng
+        el_min,   el_max   = el_rng
+
+    while True:
+        # 連続乱数 sampling
+        dist   = random.uniform(dist_min, dist_max)   # [m]
+        az_deg = random.uniform(-180.0, 180.0)        # [deg]
+        el_deg = random.uniform(el_min, el_max)       # [deg]
+
+        # 量子化 (1 cm / 1°)
+        dist_q = _snap(dist, GRID_CM / 100)           # [m]
+        az_q   = _snap(az_deg, GRID_DEG)
+        el_q   = _snap(el_deg, GRID_DEG)
+
+        # セル番号を整数化して parity 判定
+        cell_d = int(round(dist_q / (GRID_CM / 100)))
+        cell_a = int(round((az_q + 180.0) / GRID_DEG))
+        cell_e = int(round((el_q - el_min) / GRID_DEG))
+        parity = (cell_d + cell_a + cell_e) & 1        # 0=偶,1=奇
+        want   = 1 if split == "test" else 0
+        if parity != want:
+            continue  # split に合わなければ再 sampling
+
+        # 条件クリア。src 座標を計算して返す
+        az_rad = math.radians(az_q)
+        el_rad = math.radians(el_q)
+        src = ctr + dist_q * np.array([
+            math.cos(el_rad)*math.cos(az_rad),
+            math.cos(el_rad)*math.sin(az_rad),
+            math.sin(el_rad)
+        ])
+        return src, dist_q, az_q, el_q
+    
+
+def trim_pad(x, fs, min_sec=4.0):
+    y, _ = librosa.effects.trim(x, top_db=30)
+    need = int(min_sec*fs) - len(y)
+    if need>0: y = np.tile(y, math.ceil(need/len(y)))[:need+len(y)]
+    return y
+
+def spatial_foa(in_wav: Path | str, out_dir: Path, split: Literal["train","val","test"],
+                room_conf=None, stereo_out=False):
+    in_wav = Path(in_wav)
+    wav, fs = _load_audio(in_wav)
+
+    wav = trim_pad(wav, fs)
+    print(f"Loaded {in_wav.name} : {len(wav)/fs:.2f}s @ {fs} Hz")
+    room_cfg = room_conf if room_conf else _rand_room(split)
+    w,h,H = room_cfg["dims"]; alpha = room_cfg["alpha"]
+    room = pra.ShoeBox([w,h,H], fs=fs,
+                       materials=pra.Material(alpha), max_order=10)
+    ctr = np.array([w/2,h/2,H/2])
+
+    rng = cfg["TEST"] if split=="test" else cfg["TRAINVAL"]
+    src, dist, az_deg, el_deg = _rand_position(
+        split, ctr, (rng["DIST_MIN"], rng["DIST_MAX"]),
+        (rng["EL_MIN"],   rng["EL_MAX"])
+    )
+
+    # ─── ソース位置を必ず部屋の内側に収める ──────────
+    # 端から0.1mずつマージンを取ってクリップ
+    dims = np.array(room.shoebox_dim)
+    margin = 0.1
+    src = np.clip(src, margin, dims - margin)
     room.add_source(src.tolist(), signal=wav)
-
-    # 3) 残響付加
+    # 正四面体マイク
+    r=0.05; v=r/math.sqrt(3)
+    tet = np.array([[ v, v, v], [ v,-v,-v], [-v, v,-v], [-v,-v, v]]).T
+    room.add_microphone_array(pra.MicrophoneArray(ctr.reshape(3,1)+tet,fs))
     room.compute_rir()
-    rir_lst = [np.asarray(room.rir[m][0]).ravel() for m in range(len(room.rir))]
-    Rmax = max(len(r) for r in rir_lst)
-    rir_pad = [np.pad(r, (0, Rmax - len(r))) for r in rir_lst]
-    sig_tet = convolve_mc(wav, rir_lst)
+    # ---- RIR 畳み込み（4ch）-----------------------------------
+    # room.rir[m][s]   ← m=マイク index, s=ソース index (今回 0 のみ)
+    outs = [
+        fftconvolve(
+            wav,
+            np.asarray(room.rir[m][0]).ravel(),   # ← マイク m の RIR
+            mode="full"
+        )
+        for m in range(len(room.rir))             # 4 本ループ
+    ]
 
-    # 4) アクティブレベル調整
-    target = random.uniform(ASL_MIN, ASL_MAX)
-    sig_tet *= undb(target - db(active_rms(sig_tet, fs)))
+    Tmax = max(len(o) for o in outs)              # 最長サンプル数
+    outs = [np.pad(o, (0, Tmax - len(o))) for o in outs]  # 右側ゼロ詰め
 
-    # 5) FOA 変換 (SN3D, ACN)
-    p1, p2, p3, p4 = sig_tet
-    W = (p1 + p2 + p3 + p4) / 2
-    X = (p1 + p2 - p3 - p4) / 2
-    Y = (p1 - p2 - p3 + p4) / 2
-    Z = (p1 - p2 + p3 - p4) / 2
-    sig_foa = np.stack([W,X,Y,Z])
+    mic4 = np.stack(outs)                         # shape = (4, Tmax)
 
-    # 5bis) ピーク正規化（クリップ防止）
-    peak = np.max(np.abs(sig_foa))
-    if peak > 0.99:
-        sig_foa *= (0.99 / peak)
-        print(f'⚠️ clip prevention: peak {peak:.3f} → 0.99')
+    # Level & Clip
+    #peak=np.max(np.abs(mic4)); 
+   # if peak>0.99: mic4 *= 0.99/peak
 
-    # 6) メタデータ計算 (Sabine式)
-    V = np.prod(room.shoebox_dim)
-    S = 2*(room.shoebox_dim[0]*room.shoebox_dim[1] +
-           room.shoebox_dim[0]*room.shoebox_dim[2] +
-           room.shoebox_dim[1]*room.shoebox_dim[2])
-    T60 = 0.161 * V / (S * alpha)
-    full_T30_ms = round(float(T60*500), 1)
+    W=(mic4[0]+mic4[1]+mic4[2]+mic4[3])/2
+    X=(mic4[0]+mic4[1]-mic4[2]-mic4[3])/2
+    Y=(mic4[0]-mic4[1]-mic4[2]+mic4[3])/2
+    Z=(mic4[0]-mic4[1]+mic4[2]-mic4[3])/2
+    foa=np.stack([W,X,Y,Z])
 
-    # 7) 保存
     out_dir.mkdir(parents=True, exist_ok=True)
-    sf.write(out_dir/'mic4.wav', sig_tet.T, fs)
-    sf.write(out_dir/'foa.wav', sig_foa.T, fs)
-    np.save(out_dir/'rir.npy', np.stack(rir_pad))
+    sf.write(out_dir/'mic4.wav', mic4.T, fs)
+    sf.write(out_dir/'foa.wav',  foa.T,  fs)
+    if stereo_out:
+        # ★ W±Y デコード  + クリップ抑制
+        L = foa[0] + foa[2]          # W+Y
+        R = foa[0] - foa[2]          # W−Y
+        stereo = np.stack([L, R])
+        #peak = np.max(np.abs(stereo))
+        #if peak > 1.0:
+         #   stereo /= peak
+        sf.write(out_dir/'stereo.wav', stereo.T, fs)
+    meta=dict(
+        dims=room_cfg["dims"],
+        area_m2=room_cfg["area_m2"],
+        alpha=float(alpha),
+        fullband_T30_ms=room_cfg["T30_ms"],
+        source_distance_m=round(dist,3),
+        azimuth_deg=round(az_deg,2),
+        elevation_deg=round(el_deg,2),
+        split=split
+    )
+    Path(out_dir/'meta.yml').write_text(yaml.dump(meta, sort_keys=False))
 
-    meta = {
-        'fs': fs,
-        'room_dim': [round(float(x),3) for x in room.shoebox_dim],
-        'room_floor_m2': round(float(room.shoebox_dim[0]*room.shoebox_dim[1]),2),
-        'source_pos': [round(float(x),3) for x in src],
-        'azimuth_deg': round(float(np.degrees(np.arctan2(src[1]-ctr[1], src[0]-ctr[0]))),2),
-        'elevation_deg': round(float(np.degrees(np.arcsin((src[2]-ctr[2])/dist))),2),
-        'source_distance_m': round(float(dist),3),
-        'fullband_T30_ms': full_T30_ms,
-        'mic': 'tetra r=0.05',
-        'target_asl_dB': round(float(target),2),
-        'foa_format': 'SN3D ACN (WXYZ)'
-    }
-    (out_dir/'meta.yml').write_text(yaml.dump(meta, sort_keys=False))
-    print('✅ files saved to', out_dir.resolve())
-
-
-# ──────────────────── CLI ────────────────────
-if __name__ == '__main__':
-    if len(sys.argv) != 3:
-        print('usage: python SpatialAudio.py <input.wav|mp3> <out_dir>')
+# CLI ≒ quick test
+if __name__=="__main__":
+    if len(sys.argv)!=4:
+        print("usage: SpatialAudio.py in.wav out_dir train|val|test")
         sys.exit(1)
-    spatial_foa(Path(sys.argv[1]), Path(sys.argv[2]))
+    spatial_foa(Path(sys.argv[1]), Path(sys.argv[2]), split=sys.argv[3],
+                stereo_out=True)

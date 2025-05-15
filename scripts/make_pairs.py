@@ -1,108 +1,190 @@
 #!/usr/bin/env python3
 """
-make_pairs.py
-    - 元 CSV を読み取り
-    - SpatialAudio.spatial_foa() で FOA + meta を生成
-    - SpatialCaps.rewrite_spatial_caption() で空間キャプションを生成
-    - manifest.csv を書き出す
-usage:
-    python make_pairs.py \
-        --csv  val_min.csv \
-        --audio-dir wav \
-        --out-dir pairs \
-        --manifest manifest.csv \
-        --workers 4
+make_pairs.py  –  AudioCaps を FOA 拡張 + GPT 空間キャプション化
+
+例)
+python scripts/make_pairs.py \
+    --split test \
+    --csv  val_min.csv \
+    --audio-dir val_min \
+    --out-dir aa \
+    --workers 8 \
+    --spatial-parallel 6
 """
-import sys
 from pathlib import Path
-sys.path.append(str(Path(__file__).resolve().parent))  # ← scripts/ ディレクトリを追加
-from pathlib import Path
-import argparse, csv, traceback, concurrent.futures as futures
-
+import random, argparse, yaml, csv, traceback
+import concurrent.futures as fut
 import pandas as pd
-import yaml
 
-# ① 既存スクリプトを import して関数を直呼び
-from SpatialAudio import spatial_foa          # ← generate FOA
-from SpatialCaps  import rewrite_spatial_caption, load_meta  # ← GPT caption
+from SpatialAudio import spatial_foa
+from SpatialCaps  import rewrite_spatial_caption
+from json import loads
 
-def process_row(row, audio_dir: Path, out_dir: Path):
-    """1本の音声を処理するユーティリティ。  
-       例外は caller 側で握りつぶして continue できる形で戻す。"""
-    audio_id   = str(row["audiocap_id"])
-    caption    = row["caption"]
-    in_file    = audio_dir / f"{audio_id}.mp3"
-    sample_out = out_dir / audio_id        # eg. pairs/107890/
+# ────────────────────────────────────────────────────────────
+def gen_sample(row              : dict,
+               split            : str,
+               out_root         : Path,
+               suffix:str       = "",
+               pair_id:str      = "",
+               pair_type:str    = "",
+               room_conf:dict   = None,
+               stereo:bool      = "") -> dict:
+    """
+    1 本の mp3 を
+      • FOA(+mic4) 生成
+      • meta.yml -> GPT キャプション生成
+      • caption.txt 保存
+    """
+    in_wav = Path(row["file"])              # すでに絶対パスにしてある
+    if not in_wav.exists():
+        return {"ok": False, "id": row["id"], "reason": "audio_missing"}
 
-    if not in_file.exists():
-        return dict(id=audio_id, ok=False, reason="audio_missing")
+    out_dir = out_root / f"{row['audiocap_id']}{suffix}"
 
     try:
-        # 1) FOA など生成（mic4.wav, foa.wav, meta.yml）
-        spatial_foa(in_file, sample_out)
-
-        # 2) meta.yml 読み込み → 空間キャプション生成
-        meta = load_meta(sample_out / "meta.yml")
-        new_cap = rewrite_spatial_caption(caption, meta)
-
-        # 3) 生成キャプションをテキストで保存
-        (sample_out / "caption.txt").write_text(new_cap, encoding="utf-8")
+        spatial_foa(in_wav, out_dir, split=split,
+                    room_conf=room_conf, stereo_out=stereo)
+        meta = yaml.safe_load((out_dir / "meta.yml").read_text())
+        cap  = rewrite_spatial_caption(row["caption"], meta)
+        (out_dir / "caption.txt").write_text(cap, encoding="utf8")
 
         return dict(
-            id       = audio_id,
-            ok       = True,
-            caption  = new_cap,
-            mic4     = str((sample_out/'mic4.wav').resolve()),
-            foa      = str((sample_out/'foa.wav').resolve()),
-            meta     = str((sample_out/'meta.yml').resolve())
+            ok=True,
+            id=out_dir.name,
+            pair_id=pair_id,
+            pair_type=pair_type or "single",
+            caption=cap,
+            mic4=str((out_dir / "mic4.wav").resolve()),
+            foa =str((out_dir / "foa.wav").resolve()),
+            stereo=str((out_dir / "stereo.wav").resolve()),
+            meta=str((out_dir / "meta.yml").resolve()),
         )
 
     except Exception as e:
         traceback.print_exc()
-        return dict(id=audio_id, ok=False, reason=str(e))
+        return {"ok": False, "id": row["id"], "reason": str(e)}
 
+
+# ────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", required=True, help="元 CSV (id, caption 列があること)")
-    ap.add_argument("--audio-dir", required=True, help="元 mp3/wav のフォルダ")
-    ap.add_argument("--out-dir", required=True, help="生成物を書き出すルート")
-    ap.add_argument("--manifest", default="manifest.csv",
-                    help="ペア一覧を書き出す CSV (append)")
-    ap.add_argument("--workers", type=int, default=1,
-                    help="並列実行ワーカー数 (CPU/GPUに応じて調整)")
+    ap.add_argument("--split", required=True, choices=["train", "val", "test"])
+    ap.add_argument("--csv", required=True)
+    ap.add_argument("--audio-dir", required=True)
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--spatial-parallel", type=int, default=0)
+    ap.add_argument("--audio-parallel",   type=int, default=0)
+    ap.add_argument("--stereo", default=False, type=bool)
     args = ap.parse_args()
 
-    audio_dir = Path(args.audio_dir)
-    out_dir   = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
+    # ── 入力 CSV を読み込み & ファイルパス列を作成
+    audio_dir = Path(args.audio_dir).resolve()
     df = pd.read_csv(args.csv)
-    needed_cols = {"audiocap_id", "caption"}
-    if not needed_cols.issubset(df.columns):
-        raise ValueError(f"CSV には {needed_cols} が必要です")
+    df["id"] = df["audiocap_id"]  
+    df["file"] = df["audiocap_id"].astype(str).apply(
+        lambda x: str(audio_dir / f"{x}.mp3"))
+    rows = df.to_dict("records")
+    random.shuffle(rows)
 
-    results = []
-    with futures.ProcessPoolExecutor(max_workers=args.workers) as ex:
-        futs = [ex.submit(process_row, row, audio_dir, out_dir)
-                for _, row in df.iterrows()]
-        for f in futures.as_completed(futs):
-            results.append(f.result())
+    # 出力ルート
+    out_root = Path(args.out_dir) / args.split
+    out_root.mkdir(parents=True, exist_ok=True)
 
-    # manifest 追記
-    man_path = Path(args.manifest)
-    new_rows = [r for r in results if r["ok"]]
-    write_header = not man_path.exists()
-    with man_path.open("a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f,
-            fieldnames=["id","caption","mic4","foa","meta"], extrasaction="ignore")
+    futures = []
+
+    # --------------------------------------------------------
+
+
+# ────────────────────────────────────────────────────────────
+    with fut.ProcessPoolExecutor(args.workers) as ex:
+
+        # ① 空間パラレル（同一音声・別 RIR）
+        if args.spatial_parallel:
+            # split に応じた room_pool を読み込む
+            pool_file = "room_pool_trainval.json" if args.split in ("train", "val") else "room_pool_test.json"
+            room_pool = loads(Path(pool_file).read_text())
+
+            # pop できる行数に合わせて最大件数を clamp
+            max_sp = min(args.spatial_parallel, len(rows))
+            if max_sp < args.spatial_parallel:
+                print(f"⚠ spatial_parallel too large ({args.spatial_parallel}), reducing to {max_sp}")
+
+            for i in range(max_sp):
+                pair_id = f"SP{str(i).zfill(4)}"
+                # 必要なら行が残っているかチェック
+                if not rows:
+                    raise RuntimeError("Not enough rows remaining for spatial_parallel")
+                r = rows.pop(0)
+                for suf in ("A", "B"):
+                    futures.append(
+                        ex.submit(
+                            gen_sample, r, args.split, out_root,
+                            suffix=f"_{suf}",
+                            pair_id=pair_id,
+                            pair_type="spatial",
+                            stereo=args.stereo
+                        )
+                    )
+
+        # ② 音源パラレル（別音声・同一 RIR）
+        if args.audio_parallel:
+            # split に応じた room_pool を読み込む
+            pool_file = "room_pool_trainval.json" if args.split in ("train", "val") else "room_pool_test.json"
+            room_pool = loads(Path(pool_file).read_text())
+
+            # pop できる行数に合わせて最大件数を clamp (各ジョブで2行消費)
+            max_ap = min(args.audio_parallel, len(rows) // 2)
+            if max_ap < args.audio_parallel:
+                print(f"⚠ audio_parallel too large ({args.audio_parallel}), reducing to {max_ap}")
+
+            for i in range(max_ap):
+                pair_id = f"AP{str(i).zfill(4)}"
+                room_conf = random.choice(room_pool)
+                for _ in range(2):
+                    if not rows:
+                        raise RuntimeError("Not enough rows remaining for audio_parallel")
+                    r = rows.pop(0)
+                    futures.append(
+                        ex.submit(
+                            gen_sample, r, args.split, out_root,
+                            pair_id=pair_id,
+                            pair_type="audio",
+                            room_conf=room_conf,
+                            stereo=args.stereo
+                        )
+                    )
+
+        # ③ 残り
+        for r in rows:
+            futures.append(
+                ex.submit(
+                    gen_sample, r, args.split, out_root,
+                    stereo=args.stereo
+                )
+            )
+# ────────────────────────────────────────────────────────────
+
+    # --------------------------------------------------------
+    # gather
+    results = [f.result() for f in fut.as_completed(futures)]
+    results = [r for r in results if r.get("ok")]
+
+    # manifest へ書き込み
+    man_file = Path(f"manifest_{args.split}.csv")
+    header   = ["id", "pair_id", "pair_type",
+                "caption", "mic4", "foa","stereo","meta"]
+    write_header = not man_file.exists()
+
+    with man_file.open("a", newline="", encoding="utf8") as fp:
+        w = csv.DictWriter(fp, fieldnames=header, extrasaction="ignore")
         if write_header:
             w.writeheader()
-        w.writerows(new_rows)
+        w.writerows(results)
 
-    # サマリ
-    total = len(results)
-    ok    = sum(r["ok"] for r in results)
-    print(f"\n✅ Done. success {ok}/{total}   manifest → {man_path}")
+    print(f"✅ {args.split}: {len(results)} samples written → {man_file}")
 
+
+# ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     main()

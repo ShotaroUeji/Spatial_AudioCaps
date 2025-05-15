@@ -4,17 +4,24 @@ SpatialCaps.py: Rewrite a spatial audio caption using OpenAI's Chat API.
 
 Usage (Windows PowerShell):
   # Set your API key in PowerShell
-  $Env:OPENAI_API_KEY = "your_api_key_here"必須linuxだとexport OPENAI_API_KEY="your_api_key_here"かも
+  $Env:OPENAI_API_KEY = "your_api_key_here"  # ※Linuxだと export OPENAI_API_KEY="your_api_key_here"
   python SpatialCaps.py --meta output/meta.yml --caption "Someone crumples paper"
 
 Alternative: derive original caption from a CSV mapping of IDs (e.g., train.csv):
   python SpatialCaps.py --meta output/meta.yml --id 91139 --csv train.csv
+
 Dependencies:
   pip install openai pyyaml pandas
 """
 import os
 import openai
-openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# ↓ここから追加！─────────────────────────────
+def load_api_key(path="openai_api_key.txt"):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+openai.api_key = load_api_key()  # txtからAPIキーを読み込む
+# ↑ここまで追加！─────────────────────────────
 
 
 import argparse
@@ -34,7 +41,7 @@ def map_direction(az):
         return 'right'
     elif -125.0 <= az <= -55.0:
         return 'left'
-    elif -145.0 <= az <= 45.0:
+    elif az <= -145.0 and  145.0 <= az:
         return 'back'
     else:
         return ''
@@ -80,7 +87,7 @@ def rewrite_spatial_caption(original, meta):
     az_deg = meta.get('azimuth_deg')
     ele_deg = meta.get('elevation_deg')
 
-    room_floor_m2 = meta.get('room_floor_m2') 
+    room_floor_m2 = meta.get('area_m2') 
     t30 = meta.get('fullband_T30_ms')
 
     distance = map_distance(dist)
@@ -105,7 +112,7 @@ def rewrite_spatial_caption(original, meta):
         'Rephrase as a short English sentence describing the sound and all details of its source.'
     )
 
-    # Call OpenAI Chat API (v1.0+ interface) ([note.com](https://note.com/gorojy/n/n5e37bf9df9b0?utm_source=chatgpt.com))
+    # Call OpenAI Chat API (v1.0+ interface)
     response = openai.chat.completions.create(
         model='gpt-4o',
         messages=[

@@ -1,0 +1,11 @@
+dims:
+- 12.078
+- 12.078
+- 3.215
+area_m2: 145.87
+alpha: 0.3246
+fullband_T30_ms: 520.4
+source_distance_m: 3.39
+azimuth_deg: 165
+elevation_deg: 29
+split: test

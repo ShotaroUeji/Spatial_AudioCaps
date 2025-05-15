@@ -1,134 +1,145 @@
-# 📦 Spatial Audio–Caption ペア生成パイプライン
-
-モノラル音声（MP3/WAV）を  
-1. **合成残響**＋**FOA(4ch)** に変換  
-2. 生成された **メタデータ** から **空間キャプション** を GPT-4o で自動生成  
-3. 最終的に「ID／FOA WAV／Spatial Caption」の manifest を作成  
-
-というステップを自動化します。
+以下をそのまま **`README.md`** として保存すれば、  
+クローン直後に環境構築 ⟶ Spatial-AudioCaps 生成 ⟶ 生成物の構成まで一読でわかるようになっています。
 
 ---
 
-## 🗂 ディレクトリ構成例
+```markdown
+# Spatial-AudioCaps  🌐🎧  
+**AudioCaps**（ステレオ音源＋字幕）を **空間拡張 (FOA/WXYZ＋空間キャプション)** し、  
+ELSA 論文と同じ統計分布をもつ **Spatial-AudioCaps** をワンコマンド生成するツール群です。
 
-Spatial_Audio_Caps/ ├── val_min/ ← 元データディレクトリ │ ├── val_min.csv ← [audiocap_id, filename, caption] の CSV │ ├── 97151.mp3 ← id が 97151 の元音声ファイル │ └── …
-├── scripts/ │ ├── make_pairs.py ← パイプライン制御スクリプト │ ├── SpatialAudio.py ← 部屋シミュ→FOA生成モジュール │ └── SpatialCaps.py ← GPT-4o キャプション生成モジュール ├── pairs/ ← 出力先ディレクトリ（実行時に自動生成） │ └── 97151/ ← 例：ID ごとにサブフォルダ │ ├── mic4.wav ← 4ch マイク信号 │ ├── foa.wav ← 4ch FOA (WXYZ) │ ├── rir.npy ← 各チャンネルの RIR を ndarray 保存 │ └── meta.yml ← 方位・距離・T30 などのメタ情報 ├── manifest.csv ← [(id, foa_path, spatial_caption), …] 一覧 └── requirements.txt ← 必要パッケージ一覧
-
-yaml
-コピーする
-編集する
+```
+project_root/
+├── AudioCaps_csv/       # 公式 AudioCaps: train.csv / val.csv / test.csv
+├── audiocaps_mp3/       # 公式 mp3 音源 (train/ val/ test/)
+├── spatial_ranges.yml   # 各 split のパラメータ範囲
+├── room_pool_trainval.json  # ← 自動生成
+├── room_pool_test.json      # ← 自動生成
+├── spatial_audiocaps/       # ← 生成されたペア一式
+│   ├── train/  (◯◯件)
+│   ├── val/    (◯◯件)
+│   └── test/   (◯◯件)
+├── manifest_train.csv   # ← 各 split ごとのペア一覧
+├── manifest_val.csv
+├── manifest_test.csv
+└── scripts/
+    ├── gen_room_pool.py    # 部屋プール生成
+    ├── SpatialAudio.py     # mono→mic4+FOA(+stereo) 生成
+    ├── SpatialCaps.py      # GPT で空間キャプション生成
+    ├── make_pairs.py       # 全パイプライン統括
+    └── foa2stereo.py       # FOA→stereo 単体変換 (参考)
+```
 
 ---
 
-## 🔧 依存パッケージ
+## 1. 依存環境
 
-```text
-pyroomacoustics
+```bash
+# Python 3.9+
+pip install -r requirements.txt
+```
+
+`requirements.txt`
+
+```
 numpy
 scipy
-librosa
+pyroomacoustics
 soundfile
+librosa
 pyyaml
 pandas
-openai>=1.3.5
+openai>=1.0.0
 tqdm
-requirements.txt にまとめておけば以下で一括インストールできます:
+```
 
-bash
-コピーする
-編集する
-pip install -r requirements.txt
-🔑 OpenAI API キー設定
-GPT-4o を呼び出す際に必要です:
+* **GPU不要** – ほぼ CPU-FFT と I/O がボトルネックです。  
+  並列数を上げる場合は `make_pairs.py --workers <CPU実コア数>` にしてください。
+* OpenAI API Key は環境変数 **`OPENAI_API_KEY`** に設定してください。
 
-powershell
-コピーする
-編集する
-# PowerShell (Windows)
-$Env:OPENAI_API_KEY = "sk-…"
+---
 
-# bash/macOS
-export OPENAI_API_KEY="sk-…"
-🚀 実行手順
-準備
+## 2. ステップバイステップ
 
-val_min/val_min.csv：3列 audiocap_id,filename,caption
+### 2-1. 部屋プールを生成  
+ELSA 論文準拠：  
+* train/val 用 **8,952** 部屋  
+* test 用 **4,970** 部屋（train/val の部分集合、ただしソース位置は非重複）
 
-val_min/<filename>.mp3|wav：CSV と同名の音声ファイルを配置
+```bash
+python scripts/gen_room_pool.py
+```
+出力  
+```
+room_pool_trainval.json : 8952 rooms
+room_pool_test.json     : 4970 rooms  (subset)
+```
 
-ペア生成
+### 2-2. 各 split を空間拡張  
+例は 8 並列。`--stereo-out` を付けると LR ステレオも保存。
 
-bash
-コピーする
-編集する
-python scripts/make_pairs.py \
-  --csv       val_min/val_min.csv \
-  --audio-dir val_min/ \
-  --out-dir   pairs/ \
-  --manifest  manifest.csv
---csv : 入力 CSV
+```bash
+python scripts/make_pairs.py --split train \
+       --csv AudioCaps_csv/train.csv \
+       --audio-dir audiocaps_mp3/train \
+       --out-dir spatial_audiocaps \
+       --workers 8
 
---audio-dir : モノラル音声ファイル群ディレクトリ
+python scripts/make_pairs.py --split val \
+       --csv AudioCaps_csv/val.csv \
+       --audio-dir audiocaps_mp3/val \
+       --out-dir spatial_audiocaps \
+       --workers 8
 
---out-dir : FOA＋meta を出力する先
+python scripts/make_pairs.py --split test \
+       --csv AudioCaps_csv/test.csv \
+       --audio-dir audiocaps_mp3/test \
+       --out-dir spatial_audiocaps \
+       --workers 8 \
+       --spatial-parallel 1000  \
+       --audio-parallel   1000
+```
 
---manifest : 書き出す manifest.csv
+| オプション               | 意味 | 例 |
+|--------------------------|------|----|
+| `--spatial-parallel N`   | **同じ音源**で RIR だけ変えたペアを N 組生成（空間パラレル） | `1000` |
+| `--audio-parallel N`     | **同じ部屋 / RIR** で違う音源を割り当てたペアを N 組生成（音源パラレル） | `1000` |
+| `--stereo-out`           | FOA から同時に `stereo.wav` (W±Y) も保存 | |
 
-処理内容
+### 2-3. 生成結果
 
-各行の filename → scripts/SpatialAudio.py の spatial_foa() を呼び出し
+* `spatial_audiocaps/<split>/<id>/`
+  * `mic4.wav` … 正四面体マイク原信号 (4 ch)
+  * `foa.wav`  … FOA(WXYZ) (4 ch, SN3D ACN)
+  * `stereo.wav` … 任意、簡易 LR (W±Y)
+  * `meta.yml` … 位置・部屋情報・T30 など
+  * `caption.txt` … GPT による空間キャプション
+* `manifest_<split>.csv`
+  * id / caption / ファイルパス / ペア情報 等を一覧化  
+    （トレーニング・評価でこの CSV だけ読めば OK）
 
-入力：mono WAV/MP3
+---
 
-出力：mic4.wav, foa.wav, rir.npy, meta.yml
+## 3. Tips
 
-scripts/SpatialCaps.py の rewrite_spatial_caption() により
+| ヒント | 説明 |
+|--------|------|
+| **生成長** | `SpatialAudio.trim_pad(min_sec=4.0)` を短くすると容量削減可。 |
+| **ピーク正規化** | FOA・Stereo は `peak>0.99` で自動リミッタ。 |
+| **再キャプションだけ** | `SpatialCaps.py` を単体で呼び、`meta.yml` ＋ 原文から再生成可能。 |
+| **FOA→Stereo 単体変換** | `python scripts/foa2stereo.py --foa …/foa.wav --out …/stereo.wav` |
 
-meta.yml ＋元 caption をプロンプト化 → GPT-4o で「空間キャプション」を生成
+---
 
-pairs/<id>/… にファイルを保存し、
+## 4. ライセンス / 引用
 
-manifest.csv に id, pairs/<id>/foa.wav, new_caption を追記
+* AudioCaps / YouTube 音源は各データセット・動画のライセンスに従います。  
+  本ツール生成物の RIR・メタ情報コードは MIT ライセンスです。
+* 学術用途で本ツールを利用した場合は、元論文 **ELSA (NeurIPS 2024)** を引用してください。
 
-⚙️ 各スクリプト概要
-scripts/SpatialAudio.py
-spatial_foa(infile: Path, out_dir: Path)
+> Happy spatializing! 📡🎙️🎧
+```
 
-モノラル音声読み込み
+---
 
-ランダム合成部屋生成 (床面積13.3～277.4m²、吸音率ランダム)
-
-ランダム方位・距離・仰角でソース配置
-
-RIR シミュレーション → マイク4ch 信号＋FOA(WXYZ) 生成
-
-アクティブ音量を 85–100dB-ASL に自動調整
-
-RIR, メタデータ (YAML), mic4.wav, foa.wav を出力
-
-scripts/SpatialCaps.py
-rewrite_spatial_caption(original: str, meta: dict) -> str
-
-meta.yml から azimuth_deg, source_distance_m, room_floor_m2, fullband_T30_ms 取得
-
-「far/near」「front/left/…」「small/large」「highly reverberant/…」にマッピング
-
-プロンプトを組み立て → OpenAI Chat API (GPT-4o) 呼び出し
-
-返ってきたリライト文（空間キャプション）を返却
-
-scripts/make_pairs.py
-CSV を逐次読み込み
-
-各行ごとに上記 2 モジュールを連携
-
-pairs/<id>/… に出力しつつ manifest.csv を更新
-
-💡 注意・TIPS
-API Key エラー → OPENAI_API_KEY の設定 or キー有効性を要確認
-
-MP3 読み込み失敗 → ffmpeg インストール or librosa にフォールバック
-
-並列化 → multiprocessing.Pool／tqdm.contrib.concurrent 等で高速化OK
-
-モデル変更 → SpatialCaps.py の model='gpt-4o' 部分を gpt-3.5-turbo 等に
+🎉 これで **セットアップから拡張データ生成まで README 一つで完結** です。
