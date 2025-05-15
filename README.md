@@ -1,7 +1,4 @@
-以下をそのまま **`README.md`** として保存すれば、  
-クローン直後に環境構築 ⟶ Spatial-AudioCaps 生成 ⟶ 生成物の構成まで一読でわかるようになっています。
 
----
 
 ```markdown
 # Spatial-AudioCaps  🌐🎧  
